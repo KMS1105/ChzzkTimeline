@@ -7,16 +7,20 @@ import subprocess
 from yt_dlp import YoutubeDL
 from google import genai
 from google.genai import types
+import ollama
+import webbrowser
+import platform
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
 CONFIG_FILE = "config.json"
 
 def load_config():
+    """설정 파일 로드 (API 키 대신 모델 선택값 확인)"""
     if not os.path.exists(CONFIG_FILE):
         default_config = {
-            "TARGET_CHANNEL_ID": "스트리머의_32자리_채널_ID_입력",
-            "GEMINI_API_KEY": "AIzaSy..."
+            "TARGET_CHANNEL_ID": "채널_ID_입력",
+            "SELECTED_MODEL": "teddylee777/llama-3-korean-8b-instruct"
         }
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(default_config, f, indent=4, ensure_ascii=False)
@@ -122,7 +126,7 @@ def download_chzzk_vod_audio(chzzk_url, vod_id, start_percent=0.0, end_percent=1
     return final_output_mp3
 
 
-def transcribe_chzzk_audio(audio_path, chzzk_url, start_percent, model_size="tiny"):
+def transcribe_chzzk_audio(audio_path, chzzk_url, start_percent, model_size="turbo"):
     """
     2단계: [절대 시간 오프셋 복원 버전]
     잘려진 오디오 조각의 상대 시간을 원본 VOD의 절대 시간대(HH:MM:SS)로 자동 역산하여 스크립트를 생성합니다.
@@ -184,62 +188,124 @@ def transcribe_chzzk_audio(audio_path, chzzk_url, start_percent, model_size="tin
     print(f"✅ 원본 오프셋이 복원된 생대본 추출 완료! (보존 경로: {script_cache_path})")
     return raw_script
 
-
-def generate_chzzk_timeline(raw_script, api_key, actual_title="VOD제목", chzzk_url=""):
-    """
-    3~4단계: 구글 제미나이 정밀 가중치 필터링 및 타임라인 헤더 최종 후처리 함수
-    """
-    client = get_gemini_client(api_key)
-    
-    # 💡 [설명조 종결어미 전면 금지 및 숏폼 클립 타이틀 스타일 강제 프롬프트]
-    system_instruction = (
-        "당신은 인터넷 방송 다시보기 VOD 전문 편집자입니다.\n"
-        "대본을 분석하여 방송 중 일어난 사건과 상황을 직관적인 명사형 키워드로 요약하세요.\n\n"
+def ensure_ollama_installed():
+    """Ollama가 설치되어 있는지 확인하고, 없으면 다운로드 페이지로 안내"""
+    try:
+        subprocess.run(["ollama", "--version"], capture_output=True, check=True)
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        print("\n❌ [중요] 시스템에 'Ollama'가 설치되어 있지 않습니다.")
+        print("📥 자동 설치를 위해 다운로드 페이지를 엽니다...")
         
-        "[🔥 핵심 출력 규칙]\n"
-        "1. 설명조 금지: 모든 문장은 명사형으로 종결하고, 핵심 상황만 압축하십시오.\n"
-        "2. 오프닝 포함: 방송 시작 인사는 내용과 관계없이 반드시 첫 줄에 출력하세요.\n"
-        "3. 가중치 필터링 (wt = wf + wi):\n"
-        "   - 재미 점수(wf): 감정 변화, 리액션, 비명, 티키타카 (0 ~ 50점)\n"
-        "   - 중요 점수(wi): 메인 콘텐츠 시작, 스케줄 공지, 룰 세팅 (0 ~ 50점)\n"
-        "4. 단계 분류: 총점(wt) 기준 10점당 1단계씩 분류하며, 4단계 이상만 출력하세요.\n"
-        "5. 오타 및 잡담 배제: 맥락 없는 단어나 반복되는 잡담은 무시하십시오.\n\n"
-        
-        "[📝 출력 형식]\n"
-        "서론과 결론 없이 아래 형식만 한 줄씩 출력하세요.\n"
-        "[시간] (단계) 요약 내용"
-    )
-
-    target_models = ["gemini-2.5-flash", "gemini-1.5-flash"]
-    gemini_timeline = ""
-    
-    for model_name in target_models:
-        print(f"\n✨ 3단계: 구글 Gemini API ({model_name}) 기반 타임라인 가공 시도...")
-        try:
-            response = client.models.generate_content(
-            model=model_name,
-            contents=f"분석 대상 스크립트:\n{raw_script}\n\n위 규칙을 엄격히 지켜 6단계 이상만 출력하세요:",
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.2,
-                max_output_tokens=16384 # 👈 길게 생성되도록 최대치 할당
-            )
-        )
-            if response.text:
-                gemini_timeline = response.text.strip()
-                break
-        except Exception as e:
-            print(f"오류 발생: {e}")
-            continue
+        # OS별 다운로드 페이지 연결
+        if platform.system() == "Windows":
+            webbrowser.open("https://ollama.com/download/windows")
+        else:
+            webbrowser.open("https://ollama.com/download")
             
-    # 2. [수정] 후처리 로직 단순화
+        print("💡 페이지에서 설치 프로그램을 다운로드하여 설치를 완료한 후,")
+        print("   터미널을 완전히 껐다가 다시 켜서 프로그램을 재실행하세요.")
+        sys.exit(1)
+
+def ensure_model_exists(model_name):
+    """모델이 로컬에 없으면 자동으로 pull 수행"""
+    # 먼저 Ollama 설치 여부 확인
+    ensure_ollama_installed()
+    
+    try:
+        result = subprocess.run(["ollama", "list"], capture_output=True, text=True)
+        if model_name not in result.stdout:
+            print(f"\n📥 모델 '{model_name}'이 없습니다. 자동 설치를 시작합니다...")
+            # Ollama 서버가 켜져 있는지 확인 (연결 시도)
+            subprocess.run(["ollama", "pull", model_name], check=True)
+            print(f"✅ 모델 '{model_name}' 설치 완료!")
+    except Exception as e:
+        print(f"\n⚠️ Ollama 서비스가 실행 중인지 확인하세요! (작업표시줄 아이콘 확인)")
+        print(f"상세 에러: {e}")
+        sys.exit(1)
+
+def get_user_model_choice(default_model):
+    """사용자에게 모델 선택권을 주는 함수"""
+    models = ["teddylee777/llama-3-korean-8b-instruct", "anpigon/eeve-korean-10.8b"]
+    print(f"\n📦 사용할 모델을 선택하세요 (기본값: {default_model}):")
+    for i, model in enumerate(models):
+        prefix = "★ " if model == default_model else "  "
+        print(f"{prefix}[{i}] {model}")
+    
+    try:
+        choice = input("\n👉 번호 입력 (엔터키를 누르면 기본값 사용): ").strip()
+        return models[int(choice)] if choice.isdigit() and 0 <= int(choice) < len(models) else default_model
+    except:
+        return default_model
+
+def generate_chzzk_timeline(raw_script, actual_title="VOD제목", chzzk_url=""):
+    """
+    Ollama 공식 모델 전용 타임라인 생성 함수 (100% 다운로드 완료 대기 버전)
+    """
+    # 1. 프롬프트 로드 (prompt.txt)
+    try:
+        with open("prompt.txt", "r", encoding="utf-8") as f:
+            system_instruction = f.read()
+    except:
+        system_instruction = "당신은 VOD 편집자입니다. 대본을 분석하여 사건과 상황을 타임라인 형식으로 요약하세요."
+
+    # 2. 설정 및 모델 로드
+    CONFIG_FILE = "config.json"
+    config = {}
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    
+    # ⚠️ 중요: 허깅페이스 개인 저장소명이 아닌, Ollama 공식 등록 한국어 모델 사용
+    model_name = config.get("SELECTED_MODEL", "koesn/llama3-8b-instruct")
+
+    print(f"\n✨ 3단계: 로컬 AI ({model_name}) 기반 타임라인 가공 중...")
+    
+    try:
+        # 로컬 저장소 모델 체크
+        try:
+            local_models_data = ollama.list()
+            local_models = [m.get('model', m.get('name', '')) for m in local_models_data.get('models', [])]
+        except:
+            local_models = []
+
+        # 모델이 로컬에 없으면, 100% 완료될 때까지 붙잡고 대기(Stream)
+        if model_name not in local_models and f"{model_name}:latest" not in local_models:
+            print(f"📥 로컬 저장소에 '{model_name}' 모델이 없습니다.")
+            print(f"📥 최초 1회 실시간 자동 다운로드를 시작합니다 (약 4.7GB)...")
+            
+            # ★ 핵심: stream=True로 설정하여 다운로드 과정을 한 땀 한 땀 추적하며 코드를 대기시킵니다.
+            current_status = ""
+            for progress in ollama.pull(model_name, stream=True):
+                status = progress.get('status', '')
+                if status != current_status:
+                    print(f"🔄 다운로드 상태: {status}")
+                    current_status = status
+            
+            print("✅ [완료] 모델 파일 다운로드가 100% 완료되었습니다! 분석을 시작합니다.")
+
+        # 3. 로컬 AI 모델 호출 (이제 다운로드가 무조건 끝났으므로 안심하고 호출 가능)
+        response = ollama.chat(
+            model=model_name,
+            messages=[
+                {'role': 'system', 'content': system_instruction},
+                {'role': 'user', 'content': f"분석 대상 스크립트:\n{raw_script}"}
+            ],
+            options={'temperature': 0.2}
+        )
+        timeline_result = response['message']['content'].strip()
+        
+    except Exception as e:
+        print(f"\n❌ Ollama 실행 오류: {e}")
+        print("💡 팁: config.json의 SELECTED_MODEL이 올바른 Ollama 공식 모델명인지 확인하세요.")
+        return ""
+            
+    # 4. 타임라인 최종 후처리
     print("🛠️ 4단계: 타임라인 최종 후처리 중...")
     
-    # AI가 생성한 줄들 중에서 [00:00:00]이 들어간 줄을 모두 찾아서 지움 (중복 방지)
-    timeline_lines = [line.strip() for line in gemini_timeline.split('\n') if line.strip()]
+    timeline_lines = [line.strip() for line in timeline_result.split('\n') if line.strip()]
     timeline_lines = [line for line in timeline_lines if not line.startswith("[00:00:00]")]
     
-    # 우리가 원하는 제목으로 첫 줄 강제 고정
     title_header = f"[00:00:00] {actual_title if actual_title else 'VOD제목'}"
     timeline_lines.insert(0, title_header)
     
