@@ -126,7 +126,7 @@ def download_chzzk_vod_audio(chzzk_url, vod_id, start_percent=0.0, end_percent=1
     return final_output_mp3
 
 
-def transcribe_chzzk_audio(audio_path, chzzk_url, start_percent, model_size="base"):
+def transcribe_chzzk_audio(audio_path, chzzk_url, start_percent, model_size="turbo"):
     """
     2단계: [절대 시간 오프셋 복원 버전]
     잘려진 오디오 조각의 상대 시간을 원본 VOD의 절대 시간대(HH:MM:SS)로 자동 역산하여 스크립트를 생성합니다.
@@ -240,9 +240,9 @@ def get_user_model_choice(default_model):
 
 def generate_chzzk_timeline(raw_script, actual_title="VOD제목", chzzk_url=""):
     """
-    Ollama를 사용한 로컬 타임라인 생성 함수 (prompt.txt 적용 버전)
+    Ollama 공식 모델 전용 타임라인 생성 함수 (100% 다운로드 완료 대기 버전)
     """
-    # 1. 프롬프트 로드
+    # 1. 프롬프트 로드 (prompt.txt)
     try:
         with open("prompt.txt", "r", encoding="utf-8") as f:
             system_instruction = f.read()
@@ -250,21 +250,45 @@ def generate_chzzk_timeline(raw_script, actual_title="VOD제목", chzzk_url=""):
         system_instruction = "당신은 VOD 편집자입니다. 대본을 분석하여 사건과 상황을 타임라인 형식으로 요약하세요."
 
     # 2. 설정 및 모델 로드
+    CONFIG_FILE = "config.json"
     config = {}
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             config = json.load(f)
     
-    model_name = config.get("SELECTED_MODEL", "teddylee777/llama-3-korean-8b-instruct")
+    # ⚠️ 중요: 허깅페이스 개인 저장소명이 아닌, Ollama 공식 등록 한국어 모델 사용
+    model_name = config.get("SELECTED_MODEL", "koesn/llama3-8b-instruct")
 
     print(f"\n✨ 3단계: 로컬 AI ({model_name}) 기반 타임라인 가공 중...")
     
     try:
-        # 모델 자동 다운로드 및 분석 요청
+        # 로컬 저장소 모델 체크
+        try:
+            local_models_data = ollama.list()
+            local_models = [m.get('model', m.get('name', '')) for m in local_models_data.get('models', [])]
+        except:
+            local_models = []
+
+        # 모델이 로컬에 없으면, 100% 완료될 때까지 붙잡고 대기(Stream)
+        if model_name not in local_models and f"{model_name}:latest" not in local_models:
+            print(f"📥 로컬 저장소에 '{model_name}' 모델이 없습니다.")
+            print(f"📥 최초 1회 실시간 자동 다운로드를 시작합니다 (약 4.7GB)...")
+            
+            # ★ 핵심: stream=True로 설정하여 다운로드 과정을 한 땀 한 땀 추적하며 코드를 대기시킵니다.
+            current_status = ""
+            for progress in ollama.pull(model_name, stream=True):
+                status = progress.get('status', '')
+                if status != current_status:
+                    print(f"🔄 다운로드 상태: {status}")
+                    current_status = status
+            
+            print("✅ [완료] 모델 파일 다운로드가 100% 완료되었습니다! 분석을 시작합니다.")
+
+        # 3. 로컬 AI 모델 호출 (이제 다운로드가 무조건 끝났으므로 안심하고 호출 가능)
         response = ollama.chat(
             model=model_name,
             messages=[
-                {'role': 'system', 'content': system_instruction}, # 수정: 로드한 프롬프트 적용
+                {'role': 'system', 'content': system_instruction},
                 {'role': 'user', 'content': f"분석 대상 스크립트:\n{raw_script}"}
             ],
             options={'temperature': 0.2}
@@ -273,17 +297,15 @@ def generate_chzzk_timeline(raw_script, actual_title="VOD제목", chzzk_url=""):
         
     except Exception as e:
         print(f"\n❌ Ollama 실행 오류: {e}")
-        print("💡 팁: 작업표시줄에서 Ollama가 실행 중인지 확인하세요.")
+        print("💡 팁: config.json의 SELECTED_MODEL이 올바른 Ollama 공식 모델명인지 확인하세요.")
         return ""
             
-    # 3. 타임라인 최종 후처리
+    # 4. 타임라인 최종 후처리
     print("🛠️ 4단계: 타임라인 최종 후처리 중...")
     
-    # AI 결과값에서 빈 줄 제거 및 [00:00:00] 중복 제거
     timeline_lines = [line.strip() for line in timeline_result.split('\n') if line.strip()]
     timeline_lines = [line for line in timeline_lines if not line.startswith("[00:00:00]")]
     
-    # 실제 제목 강제 삽입
     title_header = f"[00:00:00] {actual_title if actual_title else 'VOD제목'}"
     timeline_lines.insert(0, title_header)
     
